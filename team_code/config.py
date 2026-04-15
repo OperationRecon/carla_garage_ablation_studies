@@ -598,6 +598,13 @@ class GlobalConfig:
     # -----------------------------------------------------------------------------
     # TransFuser Model
     # -----------------------------------------------------------------------------
+    # Enables fusion options: 'both', 'image_only', 'lidar_only'
+    self.fusion_mode = 'both'
+    # Enables attention gating
+    self.use_attn_gating = 0
+    # Channel swapping for training
+    self.chnl_swp = 0
+    
     # Waypoint GRU
     self.gru_hidden_size = 64
     self.gru_input_size = 256

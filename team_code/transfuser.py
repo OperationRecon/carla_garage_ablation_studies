@@ -2,6 +2,7 @@
 Implements the TransFuser vision backbone.
 """
 
+
 import math
 import torch
 from torch import nn
@@ -218,7 +219,28 @@ class TransfuserBackbone(nn.Module):
       if name in return_layers:
         break
     return features
+  
+  def apply_fusion(self, image_features, lidar_features, image_delta, lidar_delta):
+    """
+    Used To Apply feature fusion either directionally or on both sets of features
+    :param image_features: Features from image branch
+    :param lidar_features: Features from lidar branch
+    :param image_delta: Output of the fusion layer to be given into the image layer
+    :param lidar_delta: Output of the fusion layer to be given into the lidar layer
+    """
+    mode = self.config.fusion_mode
 
+    if mode == 'both':
+        return image_features + image_delta, lidar_features + lidar_delta
+
+    if mode == 'image_only':
+        return image_features + image_delta, lidar_features
+
+    if mode == 'lidar_only':
+        return image_features, lidar_features + lidar_delta
+
+    raise ValueError(f"Unknown fusion mode: {mode}")
+  
   def fuse_features(self, image_features, lidar_features, layer_idx):
     """
     Perform a TransFuser feature fusion block using a Transformer module.
@@ -251,8 +273,13 @@ class TransfuserBackbone(nn.Module):
                                            size=(lidar_features.shape[2], lidar_features.shape[3]),
                                            mode='bilinear',
                                            align_corners=False)
-    image_features = image_features + image_features_layer
-    lidar_features = lidar_features + lidar_features_layer
+      
+    image_features, lidar_features = self.apply_fusion(
+                                                      image_features,
+                                                      lidar_features,
+                                                      image_features_layer,
+                                                      lidar_features_layer
+                                                      )
 
     return image_features, lidar_features
 
@@ -280,7 +307,7 @@ class GPT(nn.Module):
 
     # transformer
     self.blocks = nn.Sequential(*[
-        Block(n_embd, config.n_head, config.block_exp, config.attn_pdrop, config.resid_pdrop)
+        Block(n_embd, config.n_head, config.block_exp, config.attn_pdrop, config.resid_pdrop, config.use_attn_gating)
         for layer in range(config.n_layer)
     ])
 
@@ -345,19 +372,23 @@ class SelfAttention(nn.Module):
     end.
     """
 
-  def __init__(self, n_embd, n_head, attn_pdrop, resid_pdrop):
+  def __init__(self, n_embd, n_head, attn_pdrop, resid_pdrop, use_attn_gating):
     super().__init__()
     assert n_embd % n_head == 0
     # key, query, value projections for all heads
     self.key = nn.Linear(n_embd, n_embd)
     self.query = nn.Linear(n_embd, n_embd)
     self.value = nn.Linear(n_embd, n_embd)
+    # headwise gating: produces one gate value per head per token
+    if use_attn_gating:
+      self.gate = nn.Linear(n_embd, n_head)
     # regularization
     self.dropout = attn_pdrop
     self.resid_drop = nn.Dropout(resid_pdrop)
     # output projection
     self.proj = nn.Linear(n_embd, n_embd)
     self.n_head = n_head
+    self.use_attention_gating = use_attn_gating
 
   def forward(self, x):
     b, t, c = x.size()
@@ -379,6 +410,17 @@ class SelfAttention(nn.Module):
 
     y = y.transpose(1, 2).contiguous().view(b, t, c)  # re-assemble all head outputs side by side
 
+
+    if self.use_attention_gating:
+      # apply headwise gating: compute gate from input tokens and broadcast to head outputs
+      gate_scores = self.gate(x)  # (b, t, n_head)
+      gate_scores = gate_scores.transpose(1, 2).unsqueeze(-1)  # (b, n_head, t, 1)
+      # y before projection currently has shape (b, t, c); reshape to (b, n_head, t, head_dim)
+      head_dim = c // self.n_head
+      y_heads = y.view(b, t, self.n_head, head_dim).transpose(1, 2)  # (b, n_head, t, head_dim)
+      y_heads = y_heads * torch.sigmoid(gate_scores)
+      y = y_heads.transpose(1, 2).contiguous().view(b, t, c)
+
     # output projection
     y = self.resid_drop(self.proj(y))
     return y
@@ -387,11 +429,11 @@ class SelfAttention(nn.Module):
 class Block(nn.Module):
   """ an unassuming Transformer block """
 
-  def __init__(self, n_embd, n_head, block_exp, attn_pdrop, resid_pdrop):
+  def __init__(self, n_embd, n_head, block_exp, attn_pdrop, resid_pdrop, use_attn_gating):
     super().__init__()
     self.ln1 = nn.LayerNorm(n_embd)
     self.ln2 = nn.LayerNorm(n_embd)
-    self.attn = SelfAttention(n_embd, n_head, attn_pdrop, resid_pdrop)
+    self.attn = SelfAttention(n_embd, n_head, attn_pdrop, resid_pdrop, use_attn_gating)
     self.mlp = nn.Sequential(
         nn.Linear(n_embd, block_exp * n_embd),
         nn.ReLU(True),  # changed from GELU
@@ -411,13 +453,17 @@ class MultiheadAttentionWithAttention(nn.Module):
     MultiheadAttention that also return attention weights
     """
 
-  def __init__(self, n_embd, n_head, pdrop):
+  def __init__(self, n_embd, n_head, pdrop, use_attn_gating):
     super().__init__()
     assert n_embd % n_head == 0
     # key, query, value projections for all heads
     self.key = nn.Linear(n_embd, n_embd)
     self.query = nn.Linear(n_embd, n_embd)
     self.value = nn.Linear(n_embd, n_embd)
+    self.use_attention_gating = use_attn_gating
+    # headwise gating: produces one gate value per head per token
+    if self.use_attention_gating:
+      self.gate = nn.Linear(n_embd, n_head)
     # regularization
     self.dropout = pdrop
     self.resid_drop = nn.Dropout(pdrop)
@@ -448,6 +494,16 @@ class MultiheadAttentionWithAttention(nn.Module):
                                                          is_causal=False)
 
     y = y.transpose(1, 2).contiguous().view(b, t, c)  # re-assemble all head outputs side by side
+
+
+    if self.use_attention_gating:
+      # apply headwise gating
+      gate_scores = self.gate(q_in)  # (b, t, n_head)
+      gate_scores = gate_scores.transpose(1, 2).unsqueeze(-1)  # (b, n_head, t, 1)
+      head_dim = c // self.n_head
+      y_heads = y.view(b, t, self.n_head, head_dim).transpose(1, 2)  # (b, n_head, t, head_dim)
+      y_heads = y_heads * torch.sigmoid(gate_scores)
+      y = y_heads.transpose(1, 2).contiguous().view(b, t, c)
 
     # output projection
     y = self.resid_drop(self.proj(y))

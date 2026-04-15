@@ -371,7 +371,21 @@ def main():
                       type=str,
                       default=str(config.compile_mode),
                       help='compile mode for torch compile')
-
+  parser.add_argument('--fusion_mode',
+                      type=str,
+                      default=str(config.fusion_mode),
+                      help='Determine fusion mode (both, lidar_only, image_only)',
+                      )
+  parser.add_argument('--use_attn_gating',
+                      type=int,
+                      default=int(config.use_attn_gating),
+                      help='Enables attention gating on transformer outputs.',
+                      )
+  parser.add_argument('--chnl-swp',
+                      type=int,
+                      default=int(config.chnl_swp),
+                      help='Enabels BGR <- RGB channel swapping on input images during training',
+                      )
   args = parser.parse_args()
   args.logdir = os.path.join(args.logdir, args.id)
 
@@ -564,7 +578,7 @@ def main():
   if bool(args.sync_batch_norm):
     model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
   find_unused_parameters = False
-  if config.use_plant:
+  if config.use_plant or config.fusion_mode != 'both':
     find_unused_parameters = True
   model = torch.nn.parallel.DistributedDataParallel(model,
                                                     device_ids=None,
@@ -809,6 +823,8 @@ class Engine(object):
     elif self.args.backbone in ('transFuser', 'aim', 'bev_encoder'):
       checkpoint = data['route'][:, :self.config.predict_checkpoint_len].to(self.device, dtype=torch.float32)
       rgb = data['rgb'].to(self.device, dtype=torch.float32)
+      if self.args.chnlswap and random.random() > 0.6:
+        rgb = rgb[:, [1,2,0], :, :]
       if self.config.use_semantic:
         semantic_label = data['semantic'].to(self.device, dtype=torch.long)
       else:
